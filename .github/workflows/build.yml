@@ -279,17 +279,36 @@ jobs:
             exit 1
           fi
 
-          REL="$(make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" kernelrelease 2>/dev/null | tail -1)"
-          REL="${REL:-4.9.227-perf+}"
+          # ---- 版本串：三道取法，任何一道取不到都不会把 step 弄挂 ----
+          # 1) 配置/编译阶段 kbuild 已经把最终版本串落盘在 out/include/config/kernel.release，
+          #    这是最干净的来源，不含 make 的 Entering/Leaving 噪声
+          REL=""
+          if [ -s out/include/config/kernel.release ]; then
+            REL="$(head -1 out/include/config/kernel.release | tr -d '\r\n')"
+          fi
+          # 2) 没有就现问一次 kbuild：--no-print-directory 直接掐掉 "make[1]: Leaving directory"
+          if [ -z "$REL" ]; then
+            REL="$(make -s --no-print-directory O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" kernelrelease 2>/dev/null \
+                   | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?' | tail -1 || true)"
+          fi
+          # 3) 清掉空白和引号，还不对就用兜底串
+          REL="$(printf '%s' "$REL" | tr -d "[:space:]\"'")"
+          case "$REL" in
+            ""|*/*|make*) REL="4.9.227-perf+" ;;
+          esac
+          # 进文件名前必须净化：make 输出里带 "/" 会让 cp 拼出一个不存在的目录（上一轮就是死在这）
+          REL_SAFE="$(printf '%s' "$REL" | sed -e 's/[^A-Za-z0-9._+-]/_/g' -e 's/__*/_/g' -e 's/_$//')"
+          [ -n "$REL_SAFE" ] || REL_SAFE="4.9.227-perf"
           echo "内核版本串: $REL"
+          echo "产物名后缀: $REL_SAFE"
 
           # 从 vmlinux 里把实际版本串抓出来，编错配置一眼能看出来
           strings out/vmlinux 2>/dev/null | grep -m1 'Linux version' || true
 
           mkdir -p artifacts
-          cp out/arch/arm64/boot/Image.gz "artifacts/PD1930CF_kernel_${REL}_Image.gz"
+          cp out/arch/arm64/boot/Image.gz "artifacts/PD1930CF_kernel_${REL_SAFE}_Image.gz"
           if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            cp out/arch/arm64/boot/Image.gz-dtb "artifacts/PD1930CF_kernel_${REL}_Image.gz-dtb"
+            cp out/arch/arm64/boot/Image.gz-dtb "artifacts/PD1930CF_kernel_${REL_SAFE}_Image.gz-dtb"
           fi
           cp out/.config artifacts/kernel_config_used.txt
           strings out/vmlinux 2>/dev/null | grep -m1 'Linux version' > artifacts/version.txt || echo "$REL" > artifacts/version.txt

@@ -50,7 +50,8 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf libelf-dev libssl-dev lzop rsync schedtool squashfs-tools xsltproc zip zlib1g-dev    
     - name: 3. 拉取编译资源
-        run git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 -b brillo-m9-release clang
+      run: |
+        git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 -b brillo-m9-release clang
     - name: 4. 配置环境&开始编译
       run: |
         cd $GITHUB_WORKSPACE

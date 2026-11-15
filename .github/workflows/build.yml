@@ -6,7 +6,7 @@ on:
       compile_variant:
         description: 'Select Variant (DEF= with ksu)'
         required: true
-        default: 'ksu'
+        default: 'normal'
         type: choice
         options:
           - both

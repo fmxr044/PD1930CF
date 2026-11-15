@@ -79,7 +79,7 @@ jobs:
       if: matrix.variant == 'normal'
       run: |
         cd $GITHUB_WORKSPACE
-        DEFCONFIG_PATH="arch/arm64/configs/vendor/kona-perf_defconfig"
+        DEFCONFIG_PATH="arch/arm64/configs/y11_defconfig"
         echo "移除KSU配置"
         sed -i '/CONFIG_KSU/d' $DEFCONFIG_PATH
         sed -i '/CONFIG_KSU_MANUAL_HOOK/d' $DEFCONFIG_PATH

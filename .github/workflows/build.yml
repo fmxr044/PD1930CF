@@ -1,48 +1,27 @@
-# ============================================================================
-# PD1930CF (msm8937 / y11)  Linux 4.9.227-perf+  编译配方
+# PD1930 (sdm439 / msm8937, Linux 4.9.227) 内核编译
 #
-# 一次编过的四个关键点（原配方全部踩错）：
-#   1. 工具链必须是 AOSP 的 aarch64-linux-android-4.9（GCC 4.9.4 + binutils 2.25）
-#      —— 不设 CC=clang、不设 LLVM=1 / LLVM_IAS=1（4.9 里这两个变量根本不存在）
-#      —— CROSS_COMPILE 前缀必须和工具链包一致
-#   2. CONFIG_EVENT_TRACK 必须打开，否则 drivers/soc/qcom/subsys-pil-tz.c 的
-#      track_event 会 undefined reference，链接阶段直接失败
-#   3. CONFIG_LOCALVERSION_AUTO 必须关，否则版本串会变成 4.9.227-perf+-g<sha>
-#   4. runner 固定 ubuntu-22.04（4.9 这种老树用全新宿主编 host 工具容易出幺蛾子）
+# 编译器：Snapdragon LLVM ARM Compiler 10.0.7 for Android NDK（原机同款）
+# 产物：Image.gz + dtb，别的不发。
+# 无兜底：配置不对、KernelSU 集成失败、编译报错、版本串不对，全部直接失败。
 #
-# 符号导出（本版新增）：
-#   CONFIG_DEBUG_KERNEL + CONFIG_KALLSYMS + CONFIG_KALLSYMS_ALL = y
-#   —— 4.9 的 Kconfig 里 KALLSYMS_ALL 依赖 DEBUG_KERNEL && KALLSYMS，
-#      少开任何一个，olddefconfig 都会把它静默清掉，所以三个一起开、最后还校验一遍。
-#   产物里额外给 System.map（全量，含 static）和 kallsyms_all.txt（nm --defined-only）。
-#   vmlinux.gz 带完整 symtab，超大就自动不传。
-# ============================================================================
+# 版本串必须等于 4.9.227-perf+：
+#   /vendor/lib/modules/wlan.ko 的 vermagic 就是 4.9.227-perf+。
+#   内核版本串差一个字符，wlan.ko 就 insmod 不进去，WiFi 直接打不开。
+#   这里三重锁：CONFIG_LOCALVERSION="-perf+"、关 LOCALVERSION_AUTO、make LOCALVERSION=（空）。
 
-name: Lawlessness
+name: Build Kernel
 
 on:
   workflow_dispatch:
     inputs:
-      compile_variant:
-        description: '变体：normal = 原版内核 / ksu = 尝试集成 KernelSU / both = 两个都编'
+      variant:
+        description: 'normal = 原版内核 / ksu = 集成 KernelSU（失败即终止）'
         required: true
-        default: 'normal'
+        default: normal
         type: choice
-        options:
-          - normal
-          - ksu
-          - both
+        options: [normal, ksu]
       ignore_warnings:
-        description: '忽略编译警告（-w）'
-        required: true
-        default: true
-        type: boolean
-      source_ref:
-        description: '源码分支/tag（留空 = 仓库默认分支）'
-        required: false
-        default: ''
-      kallsyms_all:
-        description: '导出全量符号（static/局部符号也进 kallsyms 和符号表）'
+        description: '屏蔽编译警告 (-w)'
         required: true
         default: true
         type: boolean
@@ -50,312 +29,116 @@ on:
 permissions:
   contents: read
 
-jobs:
-  # --------------------------------------------------------------------------
-  # 先把要编的变体算出来，避免 build job 里写两遍判断
-  # --------------------------------------------------------------------------
-  matrix-generator:
-    runs-on: ubuntu-22.04
-    outputs:
-      variants: ${{ steps.set-matrix.outputs.variants }}
-    steps:
-      - id: set-matrix
-        run: |
-          CHOICE="${{ github.event.inputs.compile_variant }}"
-          if [ "$CHOICE" = "both" ]; then
-            JSON='["normal","ksu"]'
-          else
-            JSON='["'"$CHOICE"'"]'
-          fi
-          echo "variants=$JSON" >> "$GITHUB_OUTPUT"
+env:
+  ARCH: arm64
+  KERNEL_LOCALVERSION: "-perf+"
+  SNAP_LLVM_REPO: https://github.com/sticpaper/Snapdragon-LLVM-ARM-Compiler-10.0.7-for-Android-NDK.git
 
-  build-kernel:
-    needs: matrix-generator
+jobs:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: ${{ fromJson(needs.matrix-generator.outputs.variants) }}
-    name: 编译内核 (${{ matrix.variant }})
+    timeout-minutes: 180
+
     steps:
-      # ----------------------------------------------------------------------
-      # 1. 源码
-      # ----------------------------------------------------------------------
-      - name: 1. 检出内核源码
+      - name: 1. 检出源码
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
-          ref: ${{ github.event.inputs.source_ref != '' && github.event.inputs.source_ref || github.event.repository.default_branch }}
 
-      # ----------------------------------------------------------------------
-      # 2. 宿主依赖（多核环境不需要 multilib，工具链是 64 位宿主程序）
-      # ----------------------------------------------------------------------
-      - name: 2. 安装编译依赖
+      - name: 2. 安装依赖
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache flex git gnupg gperf \
-            libelf-dev libssl-dev libncurses-dev lz4 lzop rsync \
-            schedtool squashfs-tools xsltproc zip zlib1g-dev
+            bc bison flex build-essential libssl-dev libelf-dev libncurses-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu xz-utils
 
-      # ----------------------------------------------------------------------
-      # 3. 交叉工具链：AOSP GCC 4.9（实测一次编过的那套）
-      #    装到 $RUNNER_TEMP，不和源码树混，避免被 git clean 误删
-      # ----------------------------------------------------------------------
-      - name: 3. 拉取 GCC 4.9 交叉工具链并自检
+      - name: 3. 安装编译器与 binutils
         run: |
           set -e
-          git clone --depth 1 -b brillo-m9-release \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
-            "$RUNNER_TEMP/gcc49"
+          TC="$RUNNER_TEMP/tc"
+          mkdir -p "$TC/asbin" "$TC/compat"
 
-          GCC_PATH="$(find "$RUNNER_TEMP/gcc49" -maxdepth 3 -type f -name 'aarch64-linux-android-gcc' | head -1)"
-          if [ -z "$GCC_PATH" ]; then
-            echo "::error::工具链包里没找到 aarch64-linux-android-gcc"
-            find "$RUNNER_TEMP/gcc49" -maxdepth 2 | head -30
-            exit 1
-          fi
+          # 原机同款编译器
+          git clone -q --depth 1 "$SNAP_LLVM_REPO" "$TC/snap-llvm"
+          "$TC/snap-llvm/bin/clang" --version | head -2
 
-          TC_PREFIX="$(dirname "$GCC_PATH")/aarch64-linux-android-"
-          echo "TC_PREFIX=$TC_PREFIX" >> "$GITHUB_ENV"
-          echo "工具链前缀: $TC_PREFIX"
-          "${TC_PREFIX}gcc" --version | head -1
-          "${TC_PREFIX}ld"  --version | head -1
+          # 这套编译器是老版本，依赖 libtinfo.so.5，新系统只有 .so.6
+          ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 "$TC/compat/libtinfo.so.5"
 
-      # ----------------------------------------------------------------------
-      # 4. KernelSU（仅 ksu 变体，尽力而为；失败就回滚，编原版）
-      #    4.9 属非 GKI，KernelSU 主线支持有限，所以这一步绝不阻塞整单
-      # ----------------------------------------------------------------------
-      - name: 4. [ksu] 尝试集成 KernelSU
-        if: matrix.variant == 'ksu'
+          # clang 用 -no-integrated-as，需要能被 --prefix 找到的 aarch64 as/ld
+          ln -sf "$(command -v aarch64-linux-gnu-as)" "$TC/asbin/as"
+          ln -sf "$(command -v aarch64-linux-gnu-ld)" "$TC/asbin/ld"
+          ln -sf "$(command -v aarch64-linux-gnu-as)" "$TC/asbin/aarch64-linux-gnu-as"
+          ln -sf "$(command -v aarch64-linux-gnu-ld)" "$TC/asbin/aarch64-linux-gnu-ld"
+          # 必须是真实文件：内核 Makefile 用 realpath(which ...-elfedit) 定位 as/ld 目录
+          cp "$(realpath "$(command -v aarch64-linux-gnu-elfedit)")" "$TC/asbin/aarch64-linux-gnu-elfedit"
+
+          cat > "$TC/asbin/clang" <<EOF
+          #!/bin/sh
+          export LD_LIBRARY_PATH="$TC/compat"
+          export COMPILER_PATH="$TC/asbin"
+          exec "$TC/snap-llvm/bin/clang" --target=aarch64-linux-android -B"$TC/asbin/" --prefix="$TC/asbin/" "\$@"
+          EOF
+          chmod +x "$TC/asbin/clang"
+          "$TC/asbin/clang" --version | head -2
+
+          echo "TC_CLANG=$TC/asbin/clang" >> "$GITHUB_ENV"
+          echo "TC_CROSS=$TC/asbin/aarch64-linux-gnu-" >> "$GITHUB_ENV"
+
+      - name: 4. 集成 KernelSU
+        if: inputs.variant == 'ksu'
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
-          if ! curl -fsSL "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" -o "$RUNNER_TEMP/ksu-setup.sh"; then
-            echo "::warning::KernelSU setup 脚本下载失败，跳过集成，直接编原版内核"
-            exit 0
-          fi
-          if bash "$RUNNER_TEMP/ksu-setup.sh" main; then
-            echo "KernelSU 集成完成，后续编译若失败会自动回滚"
-          else
-            echo "::warning::KernelSU 在 4.9 上集成失败（非 GKI 支持有限），回滚后编原版内核"
-            git checkout -- . || true
-            git clean -fdq || true
-          fi
+          set -e
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          curl -fsSL -o "$RUNNER_TEMP/ksu-setup.sh" \
+            https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh
+          bash "$RUNNER_TEMP/ksu-setup.sh" main
 
-      # ----------------------------------------------------------------------
-      # 5. 配置 + 编译（三层兜底：EVENT_TRACK / VIVO_PROJECT_MODEL / KSU 回滚）
-      # ----------------------------------------------------------------------
-      - name: 5. 配置并编译
+      - name: 5. 配置
         run: |
-          set -eo pipefail
+          set -e
+          make O=out ARCH=arm64 CC="$TC_CLANG" CROSS_COMPILE="$TC_CROSS" y11_defconfig
 
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CROSS_COMPILE="$TC_PREFIX"
-          # 版本串里的编译者与原机保持一致：compiler@comsz01078157
-          export KBUILD_BUILD_USER="compiler"
-          export KBUILD_BUILD_HOST="comsz01078157"
-          export KBUILD_BUILD_TIMESTAMP="$(TZ=Asia/Shanghai date +'%a %b %d %H:%M:%S CST %Y')"
+          # 编译必需：subsys-pil-tz.c 的 track_event 没有实现会链接失败
+          scripts/config --file out/.config -e EVENT_TRACK
+          scripts/config --file out/.config -d LOCALVERSION_AUTO
+          scripts/config --file out/.config --set-str LOCALVERSION "$KERNEL_LOCALVERSION"
 
-          if [ "${{ github.event.inputs.ignore_warnings }}" = "true" ]; then
-            export KCFLAGS="-w"
-          fi
+          make O=out ARCH=arm64 CC="$TC_CLANG" CROSS_COMPILE="$TC_CROSS" olddefconfig
 
-          JOBS="$(nproc)"
-          DEFCONFIG="y11_defconfig"
+          grep -q '^CONFIG_EVENT_TRACK=y' out/.config
+          grep -q '^CONFIG_LOCALVERSION="-perf+"' out/.config
+          grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' out/.config
 
-          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
-            echo "::error::仓库里找不到 arch/arm64/configs/$DEFCONFIG"
-            ls arch/arm64/configs/ | head -40
+      - name: 6. 编译
+        run: |
+          set -e
+          KCFLAGS=""
+          if [ "${{ inputs.ignore_warnings }}" = "true" ]; then KCFLAGS="-w"; fi
+
+          make O=out ARCH=arm64 -j"$(nproc)" \
+            CC="$TC_CLANG" CROSS_COMPILE="$TC_CROSS" \
+            KCFLAGS="$KCFLAGS" LOCALVERSION= Image.gz dtbs
+
+          REL="$(cat out/include/config/kernel.release)"
+          echo "kernel release: $REL"
+          [ "$REL" = "4.9.227-perf+" ] || {
+            echo "::error::版本串是 $REL，必须是 4.9.227-perf+，否则 wlan.ko 加载失败、WiFi 打不开"
             exit 1
-          fi
-
-          configure() {
-            make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" "$DEFCONFIG" > /dev/null
-
-            # 关键修复 1：track_event 的实现开关
-            scripts/config --file out/.config -e EVENT_TRACK
-            # 关键修复 2：保住 -perf，不要让 git 描述污染版本串
-            scripts/config --file out/.config -d LOCALVERSION_AUTO
-
-            # 导出全量符号：KALLSYMS_ALL 在 4.9 的 Kconfig 里依赖 DEBUG_KERNEL + KALLSYMS
-            # 少开任何一个，olddefconfig 都会把 KALLSYMS_ALL 悄悄清掉
-            if [ "${{ github.event.inputs.kallsyms_all }}" = "true" ]; then
-              scripts/config --file out/.config -e DEBUG_KERNEL
-              scripts/config --file out/.config -e KALLSYMS
-              scripts/config --file out/.config -e KALLSYMS_ALL
-            fi
-
-            # 4.9 的 kconfig 没有 olddefconfig 目标（4.16 才引入），降级到 silentoldconfig
-            make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" olddefconfig > /dev/null 2>&1 \
-              || make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" silentoldconfig > /dev/null 2>&1 \
-              || true
-
-            # 配置整理若因依赖不满足把它丢掉，就硬写回去
-            if ! grep -q '^CONFIG_EVENT_TRACK=y' out/.config; then
-              echo "::warning::EVENT_TRACK 依赖链未满足，直接写入 .config"
-              echo 'CONFIG_EVENT_TRACK=y' >> out/.config
-            fi
-            if grep -q '^CONFIG_LOCALVERSION_AUTO=y' out/.config; then
-              sed -i 's/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
-            fi
-            if [ "${{ github.event.inputs.kallsyms_all }}" = "true" ] && ! grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config; then
-              echo "::warning::KALLSYMS_ALL 依赖没满足，强制写回 .config"
-              {
-                echo 'CONFIG_DEBUG_KERNEL=y'
-                echo 'CONFIG_KALLSYMS=y'
-                echo 'CONFIG_KALLSYMS_ALL=y'
-              } >> out/.config
-            fi
-
-            echo "--- 关键配置 ---"
-            grep -E '^(CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|CONFIG_EVENT_TRACK=|CONFIG_MODVERSIONS=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=|CONFIG_DEBUG_KERNEL=)' out/.config || true
-            grep -E '^# CONFIG_LOCALVERSION_AUTO is not set' out/.config || true
           }
 
-          configure
-
-          ok=0
-          echo "=== 第一次编译 ==="
-          if make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" -j"$JOBS" Image.gz 2>&1 | tee build.log; then
-            ok=1
-          fi
-
-          # 兜底 A：EVENT_TRACK 没生效 -> 走原厂宏把调用点排除掉重编
-          if [ "$ok" -eq 0 ] && grep -q 'track_event' build.log; then
-            echo "::warning::track_event 仍未定义，改用 VIVO_PROJECT_MODEL 路径重编"
-            export KCFLAGS="${KCFLAGS:-} -DVIVO_PROJECT_MODEL"
-            make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" clean > /dev/null 2>&1 || true
-            echo "=== 兜底编译 A ==="
-            if make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" -j"$JOBS" Image.gz 2>&1 | tee build.log; then
-              ok=1
-            fi
-          fi
-
-          # 兜底 B：KernelSU 集成导致编不过 -> 回滚源码树，编原版
-          if [ "$ok" -eq 0 ] && [ "${{ matrix.variant }}" = "ksu" ]; then
-            echo "::warning::KSU 变体编译失败，回滚 KernelSU 后编原版内核"
-            git checkout -- . || true
-            git clean -fdq || true
-            unset KCFLAGS
-            if [ "${{ github.event.inputs.ignore_warnings }}" = "true" ]; then
-              export KCFLAGS="-w"
-            fi
-            configure
-            echo "=== 兜底编译 B（无 KernelSU） ==="
-            if make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" -j"$JOBS" Image.gz 2>&1 | tee build.log; then
-              ok=1
-            fi
-          fi
-
-          if [ "$ok" -eq 0 ]; then
-            echo "::error::内核编译失败，最后 60 行日志如下"
-            tail -60 build.log || true
-            exit 1
-          fi
-
-          # dtb 合并版（部分树没这个目标，失败不影响 Image.gz）
-          echo "=== 尝试生成 Image.gz-dtb ==="
-          if ! make O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" -j"$JOBS" Image.gz-dtb > dtb.log 2>&1; then
-            echo "::warning::Image.gz-dtb 未生成（该树可能不带此目标），仅提供 Image.gz"
-            tail -20 dtb.log || true
-          fi
-
-          ls -lh out/arch/arm64/boot/Image* || true
-
-      # ----------------------------------------------------------------------
-      # 6. 核对产物：版本串、文件大小、实际用的 config
-      # ----------------------------------------------------------------------
-      - name: 6. 核对产物
+      - name: 7. 收集产物
         run: |
           set -e
-          export ARCH=arm64
-          export CROSS_COMPILE="$TC_PREFIX"
+          mkdir -p artifacts/dtb
+          cp out/arch/arm64/boot/Image.gz artifacts/Image.gz
+          cp out/arch/arm64/boot/dts/qcom/sdm439*.dtb artifacts/dtb/
+          ls -lh artifacts artifacts/dtb
 
-          if [ ! -f out/arch/arm64/boot/Image.gz ]; then
-            echo "::error::out/arch/arm64/boot/Image.gz 不存在"
-            ls -l out/arch/arm64/boot/ || true
-            exit 1
-          fi
-
-          # ---- 版本串：三道取法，任何一道取不到都不会把 step 弄挂 ----
-          # 1) 配置/编译阶段 kbuild 已经把最终版本串落盘在 out/include/config/kernel.release，
-          #    这是最干净的来源，不含 make 的 Entering/Leaving 噪声
-          REL=""
-          if [ -s out/include/config/kernel.release ]; then
-            REL="$(head -1 out/include/config/kernel.release | tr -d '\r\n')"
-          fi
-          # 2) 没有就现问一次 kbuild：--no-print-directory 直接掐掉 "make[1]: Leaving directory"
-          if [ -z "$REL" ]; then
-            REL="$(make -s --no-print-directory O=out ARCH=arm64 CROSS_COMPILE="$TC_PREFIX" kernelrelease 2>/dev/null \
-                   | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?' | tail -1 || true)"
-          fi
-          # 3) 清掉空白和引号，还不对就用兜底串
-          REL="$(printf '%s' "$REL" | tr -d "[:space:]\"'")"
-          case "$REL" in
-            ""|*/*|make*) REL="4.9.227-perf+" ;;
-          esac
-          # 进文件名前必须净化：make 输出里带 "/" 会让 cp 拼出一个不存在的目录（上一轮就是死在这）
-          REL_SAFE="$(printf '%s' "$REL" | sed -e 's/[^A-Za-z0-9._+-]/_/g' -e 's/__*/_/g' -e 's/_$//')"
-          [ -n "$REL_SAFE" ] || REL_SAFE="4.9.227-perf"
-          echo "内核版本串: $REL"
-          echo "产物名后缀: $REL_SAFE"
-
-          # 从 vmlinux 里把实际版本串抓出来，编错配置一眼能看出来
-          strings out/vmlinux 2>/dev/null | grep -m1 'Linux version' || true
-
-          mkdir -p artifacts
-          cp out/arch/arm64/boot/Image.gz "artifacts/PD1930CF_kernel_${REL_SAFE}_Image.gz"
-          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            cp out/arch/arm64/boot/Image.gz-dtb "artifacts/PD1930CF_kernel_${REL_SAFE}_Image.gz-dtb"
-          fi
-          cp out/.config artifacts/kernel_config_used.txt
-          strings out/vmlinux 2>/dev/null | grep -m1 'Linux version' > artifacts/version.txt || echo "$REL" > artifacts/version.txt
-
-          # ---- 全量符号表 ----
-          # vmlinux 的 symtab 本来就有 static/局部符号，System.map 就是它按地址排好的全量清单
-          if [ -f out/vmlinux ]; then
-            cp out/System.map artifacts/System.map 2>/dev/null || \
-              "${TC_PREFIX}nm" -n out/vmlinux > artifacts/System.map 2>/dev/null || true
-
-            "${TC_PREFIX}nm" -n --defined-only out/vmlinux > artifacts/kallsyms_all.txt 2>/dev/null \
-              || nm -n --defined-only out/vmlinux > artifacts/kallsyms_all.txt 2>/dev/null || true
-
-            if [ -s artifacts/kallsyms_all.txt ]; then
-              echo "符号总数: $(wc -l < artifacts/kallsyms_all.txt)"
-              echo "其中局部/static 符号: $(awk '$2 ~ /^[a-z]$/ {n++} END{print n+0}' artifacts/kallsyms_all.txt)"
-            fi
-
-            # 内核运行时能查到的符号（/proc/kallsyms 全量与否）看这一个开关
-            if grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config; then
-              echo "kallsyms 全量导出：已开启（运行时 /proc/kallsyms 含 static 符号）"
-            else
-              echo "::warning::CONFIG_KALLSYMS_ALL 未开启，运行时 /proc/kallsyms 只有全局符号"
-            fi
-
-            # vmlinux 带完整 symtab，压一下；太大就只留符号表
-            gzip -9 -c out/vmlinux > artifacts/vmlinux.gz 2>/dev/null || true
-            if [ -s artifacts/vmlinux.gz ]; then
-              VSIZE=$(stat -c%s artifacts/vmlinux.gz)
-              echo "vmlinux.gz: $((VSIZE/1024/1024)) MB"
-              if [ "$VSIZE" -gt 314572800 ]; then
-                echo "::warning::vmlinux.gz 超过 300MB，不上传，只保留 System.map"
-                rm -f artifacts/vmlinux.gz
-              fi
-            fi
-          fi
-
-          echo "=== 产物 ==="
-          ls -lh artifacts
-
-      # ----------------------------------------------------------------------
-      # 7. 上传
-      # ----------------------------------------------------------------------
-      - name: 7. 上传产物
+      - name: 8. 上传
         uses: actions/upload-artifact@v7
         with:
-          name: y11-kernel-${{ matrix.variant }}
+          name: PD1930-${{ inputs.variant }}-kernel-dtb
           path: artifacts/
           if-no-files-found: error
           retention-days: 30
